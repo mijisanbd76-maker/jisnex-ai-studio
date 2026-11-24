@@ -18,16 +18,22 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import java.util.Locale
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
 
-data class Scene(val text: String, val mood: String, val voice: Int, val sec: Int)
+data class Scene(val text: String, val mood: String, val voice: Int, val sec: Int, val img: String = "")
 
 class Studio {
+    var key by mutableStateOf("")
     var script by mutableStateOf("")
     var vertical by mutableStateOf(false)
     var scenes by mutableStateOf(listOf<Scene>())
@@ -36,6 +42,8 @@ class Studio {
 }
 
 val voiceNames = listOf("মেয়ে ভয়েস", "ছেলে ১", "ছেলে ২")
+
+fun secOf(t: String) = maxOf(3, (t.split(Regex("\\s+")).size / 2.5).toInt())
 
 fun moodOf(t: String) = when {
     listOf("কাঁদ", "দুঃখ", "কষ্ট", "মৃত্যু", "হারা").any { t.contains(it) } -> "দুঃখ"
@@ -47,9 +55,20 @@ fun moodOf(t: String) = when {
 fun analyze(script: String): List<Scene> =
     script.split(Regex("(?<=[।.!?])\\s+|\\n+")).filter { it.isNotBlank() }.chunked(2).map { g ->
         val t = g.joinToString(" ").trim()
-        val words = t.split(Regex("\\s+")).size
-        Scene(t, moodOf(t), 0, maxOf(3, (words / 2.5).toInt()))
+        Scene(t, moodOf(t), 0, secOf(t))
     }
+
+fun aiAnalyze(key: String, script: String): List<Scene> {
+    val prompt = "তুমি একজন ভিডিও এডিটর। নিচের গল্পটি ৩ থেকে ১৫টি সিনে ভাগ করো। শুধু JSON array দাও, অন্য কিছু নয়। " +
+        "প্রতিটি আইটেম এমন: {\"text\":\"সিনের মূল লেখা\",\"mood\":\"শান্ত বা দুঃখ বা আনন্দ বা উত্তেজনা\",\"image\":\"ছবির জন্য ইংরেজি বর্ণনা\"}\n\nগল্প:\n" + script
+    val raw = Gemini.generate(key, prompt).replace("```json", "").replace("```", "").trim()
+    val arr = JSONArray(raw)
+    return (0 until arr.length()).map { i ->
+        val o = arr.getJSONObject(i)
+        val t = o.getString("text")
+        Scene(t, o.optString("mood", "শান্ত"), 0, secOf(t), o.optString("image"))
+    }
+}
 
 fun speak(tts: TextToSpeech?, s: Scene) {
     val (p, r) = when (s.mood) {
@@ -97,16 +116,20 @@ class MainActivity : ComponentActivity() {
     private val studio = Studio()
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val prefs = getSharedPreferences("jisnex", MODE_PRIVATE)
+        studio.key = prefs.getString("key", "") ?: ""
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(primary = Color(0xFF7C4DFF), background = Color(0xFF0E0E16), surface = Color(0xFF181824))) {
-                Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { App(studio) }
+                Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                    App(studio) { k -> studio.key = k; prefs.edit().putString("key", k).apply() }
+                }
             }
         }
     }
 }
 
 @Composable
-fun App(st: Studio) {
+fun App(st: Studio, saveKey: (String) -> Unit) {
     val nav = rememberNavController()
     NavHost(nav, "home") {
         composable("home") {
@@ -115,16 +138,50 @@ fun App(st: Studio) {
                 Text("স্ক্রিপ্ট দিন, বাকিটা অ্যাপ করবে।")
                 Go("নতুন প্রজেক্ট", nav, "script")
                 Go("শেষ প্রজেক্ট খুলুন", nav, "editor", st.scenes.isNotEmpty())
+                Go("সেটিংস (API key)", nav, "settings")
+            }
+        }
+        composable("settings") {
+            var k by remember { mutableStateOf(st.key) }
+            var saved by remember { mutableStateOf(false) }
+            Page("সেটিংস", nav) {
+                Text("Gemini API key বসান")
+                OutlinedTextField(k, { k = it; saved = false }, Modifier.fillMaxWidth(), singleLine = true, visualTransformation = PasswordVisualTransformation(), label = { Text("API key") })
+                Button(onClick = { saveKey(k.trim()); saved = true }, modifier = Modifier.fillMaxWidth()) { Text("সেভ করুন") }
+                if (saved) Text("সেভ হয়েছে ✅")
             }
         }
         composable("script") {
+            val scope = rememberCoroutineScope()
+            var busy by remember { mutableStateOf(false) }
+            var err by remember { mutableStateOf("") }
             Page("স্ক্রিপ্ট", nav) {
                 OutlinedTextField(st.script, { st.script = it }, Modifier.fillMaxWidth().weight(1f), label = { Text("গল্প বা স্ক্রিপ্ট লিখুন") })
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilterChip(!st.vertical, { st.vertical = false }, { Text("16:9 YouTube") })
                     FilterChip(st.vertical, { st.vertical = true }, { Text("9:16 Shorts") })
                 }
-                Button(onClick = { st.scenes = analyze(st.script); nav.navigate("analysis") }, enabled = st.script.isNotBlank(), modifier = Modifier.fillMaxWidth()) { Text("বিশ্লেষণ করো") }
+                if (err.isNotEmpty()) Text(err, color = MaterialTheme.colorScheme.error)
+                if (st.key.isBlank()) Text("AI ব্যবহার করতে আগে সেটিংসে API key দিন।")
+                Button(
+                    onClick = {
+                        busy = true; err = ""
+                        scope.launch {
+                            try {
+                                st.scenes = withContext(Dispatchers.IO) { aiAnalyze(st.key, st.script) }
+                                nav.navigate("analysis")
+                            } catch (e: Exception) { err = e.message ?: "ত্রুটি হয়েছে" }
+                            busy = false
+                        }
+                    },
+                    enabled = st.script.isNotBlank() && st.key.isNotBlank() && !busy,
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text(if (busy) "AI বিশ্লেষণ করছে..." else "AI দিয়ে বিশ্লেষণ") }
+                OutlinedButton(
+                    onClick = { st.scenes = analyze(st.script); nav.navigate("analysis") },
+                    enabled = st.script.isNotBlank() && !busy,
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("সাধারণ বিশ্লেষণ (অফলাইন)") }
             }
         }
         composable("analysis") {
@@ -132,9 +189,10 @@ fun App(st: Studio) {
                 LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     itemsIndexed(st.scenes) { i, s ->
                         Card(Modifier.fillMaxWidth()) {
-                            Column(Modifier.padding(12.dp)) {
+                            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                 Text("সিন ${i + 1} • ${s.mood} • ~${s.sec}s", style = MaterialTheme.typography.labelLarge)
                                 Text(s.text)
+                                if (s.img.isNotBlank()) Text("🖼 ${s.img}", style = MaterialTheme.typography.bodySmall)
                             }
                         }
                     }
